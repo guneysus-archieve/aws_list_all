@@ -2,13 +2,38 @@
 from __future__ import print_function
 
 import os
+from resource import getrlimit, setrlimit, RLIMIT_NOFILE
 from argparse import ArgumentParser
-from sys import exit
+from sys import exit, stderr
 
 from .introspection import (
     get_listing_operations, get_services, get_verbs, introspect_regions_for_service, recreate_caches
 )
 from .query import do_list_files, do_query
+
+
+def increase_limit_nofiles():
+    soft_limit, hard_limit = getrlimit(RLIMIT_NOFILE)
+    desired_limit = 6000  # This should be comfortably larger than the product of services and regions
+    if hard_limit < desired_limit:
+        print("-" * 80, file=stderr)
+        print(
+            "WARNING!\n"
+            "Your system limits the number of open files and network connections to {}.\n"
+            "This may lead to failures during querying.\n"
+            "Please increase the hard limit of open files to at least {}.\n"
+            "The configuration for hard limits is often found in /etc/security/limits.conf".format(
+                hard_limit, desired_limit
+            ),
+            file=stderr
+        )
+        print("-" * 80, file=stderr)
+        print(file=stderr)
+    target_soft_limit = min(desired_limit, hard_limit)
+    if target_soft_limit > soft_limit:
+        print("Increasing the open connection limit \"nofile\" from {} to {}.".format(soft_limit, target_soft_limit))
+        setrlimit(RLIMIT_NOFILE, (target_soft_limit, hard_limit))
+    print("")
 
 
 def main():
@@ -47,8 +72,10 @@ def main():
         action='append',
         help='Restrict querying to the given operation (can be specified multiple times)'
     )
+    query.add_argument('-p', '--parallel', default=32, type=int, help='Number of request to do in parallel')
     query.add_argument('-d', '--directory', default='.', help='Directory to save result listings to')
     query.add_argument('-v', '--verbose', action='count', help='Print detailed info during run')
+    query.add_argument('-c', '--profile', help='Use a specific .aws/credentials profile.')
 
     # Once you have queried, show is the next most important command. So it comes second
     show = subparsers.add_parser(
@@ -90,16 +117,27 @@ def main():
         action='append',
         help='Only list discovered operations of the given service (can be specified multiple times)'
     )
+    ops.add_argument('-r', '--region', default='us-east-1', help='Region to use to query for listing operations')
     introspecters.add_parser('debug', description='Debug information', help='Debug information')
 
     # Finally, refreshing the service/region caches comes last.
-    subparsers.add_parser(
+    caches = subparsers.add_parser(
         'recreate-caches',
         description=(
-            'Recreate the service/region availability caches, '
-            'in case service availability changed since the last release'
+            'The list of AWS services and endpoints can change over time. '
+            'This command (re-)creates the caches for this data to allow you to'
+            'list services in regions where they have not been available previously.'
+            'The cache lives in your OS-dependent cache directory, e.g. ~/.cache/aws_list_all/'
         ),
-        help='Recreate service caches'
+        help='Recreate service and region caches'
+    )
+    caches.add_argument(
+        '--update-packaged-values',
+        action='store_true',
+        help=(
+            'Instead of writing to the cache, update files packaged with aws-list-all. '
+            'Use this only if you run a copy from git.'
+        )
     )
 
     args = parser.parse_args()
@@ -111,10 +149,19 @@ def main():
             except OSError:
                 pass
             os.chdir(args.directory)
+        increase_limit_nofiles()
         services = args.service or get_services()
-        do_query(services, args.region, args.operation, verbose=args.verbose or 0)
+        do_query(
+            services,
+            args.region,
+            args.operation,
+            verbose=args.verbose or 0,
+            parallel=args.parallel,
+            selected_profile=args.profile
+        )
     elif args.command == 'show':
         if args.listingfile:
+            increase_limit_nofiles()
             do_list_files(args.listingfile, verbose=args.verbose or 0)
         else:
             show.print_help()
@@ -128,7 +175,7 @@ def main():
             return 0
         elif args.introspect == 'list-operations':
             for service in args.service or get_services():
-                for operation in get_listing_operations(service):
+                for operation in get_listing_operations(service, args.region):
                     print(service, operation)
         elif args.introspect == 'debug':
             for service in get_services():
@@ -138,7 +185,8 @@ def main():
             introspect.print_help()
             return 1
     elif args.command == 'recreate-caches':
-        recreate_caches()
+        increase_limit_nofiles()
+        recreate_caches(args.update_packaged_values)
     else:
         parser.print_help()
         return 1
